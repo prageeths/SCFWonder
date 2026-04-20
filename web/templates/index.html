@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SCF Wonder — LangGraph-powered Supply Chain Finance</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">✦</span>
+      <div>
+        <div class="brand-name">SCF Wonder</div>
+        <div class="brand-sub">LangGraph-powered supply chain finance</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="#dashboard" class="nav-link active" data-tab="dashboard">Dashboard</a>
+      <a href="#new-invoice" class="nav-link" data-tab="new-invoice">New Invoice</a>
+      <a href="#transactions" class="nav-link" data-tab="transactions">Transactions</a>
+      <a href="#graph" class="nav-link" data-tab="graph">Agent Graph</a>
+      <a href="#agents" class="nav-link" data-tab="agents">Agent Console</a>
+      <a href="#programs" class="nav-link" data-tab="programs">Programs</a>
+      <a href="#companies" class="nav-link" data-tab="companies">Companies</a>
+    </nav>
+    <div class="rate-pill">
+      <span class="rate-label">Base rate</span>
+      <span id="base-rate-value" class="rate-value">--%</span>
+    </div>
+  </header>
+
+  <main class="content">
+    <!-- =================== DASHBOARD =================== -->
+    <section id="dashboard" class="tab-panel active">
+      <h1>Platform Overview</h1>
+      <div class="stat-grid" id="stat-grid"></div>
+      <div class="card">
+        <div class="card-header">
+          <h2>Recent Agent Decisions</h2>
+          <span class="muted">Produced by the LangGraph run-loop</span>
+        </div>
+        <div id="recent-decisions" class="event-feed"></div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h2>By Status</h2>
+          <table class="data-table" id="status-table"></table>
+        </div>
+        <div class="card">
+          <h2>By Product</h2>
+          <table class="data-table" id="product-table"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== NEW INVOICE =================== -->
+    <section id="new-invoice" class="tab-panel">
+      <h1>Submit New Invoice</h1>
+      <p class="muted">
+        The Orchestrator agent runs a LangGraph over the Onboarding,
+        Underwriter, Credit Limit, Transaction and Review agents.
+        Every tool call below is a StructuredTool dispatched by a graph node.
+      </p>
+
+      <form id="invoice-form" class="card form-grid" autocomplete="off">
+        <label>
+          <span>Seller</span>
+          <input type="text" name="seller_name" id="seller-input" placeholder="Type to search..." required />
+          <div class="autocomplete" id="seller-suggestions"></div>
+          <div class="match-status" id="seller-status"></div>
+        </label>
+        <label>
+          <span>Buyer</span>
+          <input type="text" name="buyer_name" id="buyer-input" placeholder="Type to search..." required />
+          <div class="autocomplete" id="buyer-suggestions"></div>
+          <div class="match-status" id="buyer-status"></div>
+        </label>
+        <label>
+          <span>Product</span>
+          <select name="product" id="product-select" required>
+            <option value="FACTORING">Factoring</option>
+            <option value="REVERSE_FACTORING">Reverse Factoring</option>
+          </select>
+        </label>
+        <label>
+          <span>Amount</span>
+          <input type="number" name="amount" min="100" step="0.01" required />
+        </label>
+        <label>
+          <span>Currency</span>
+          <select name="currency" id="currency-select" required></select>
+        </label>
+        <label>
+          <span>Tenor (days)</span>
+          <select name="tenor_days" required>
+            <option value="30">30</option><option value="60">60</option><option value="90">90</option>
+          </select>
+        </label>
+        <label>
+          <span>Grace period (days)</span>
+          <input type="number" name="grace_period_days" value="0" min="0" max="30" />
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="primary">Run Agent Graph</button>
+          <button type="reset" class="ghost">Clear</button>
+        </div>
+      </form>
+
+      <div class="card" id="new-company-card" hidden>
+        <div class="card-header">
+          <h2 id="new-company-title">New counterparty onboarded</h2>
+          <span class="muted">Underwriter Agent ran automatically — you can now submit the invoice.</span>
+        </div>
+        <div id="new-company-body"></div>
+      </div>
+
+      <div class="card" id="result-card" hidden>
+        <h2>Agent Flow Result</h2>
+        <div id="decision-summary"></div>
+        <div class="tabs-inner">
+          <button class="inner-tab active" data-inner="trace">Graph Trace</button>
+          <button class="inner-tab" data-inner="tool-calls">Tool Calls</button>
+          <button class="inner-tab" data-inner="events">Persisted Events</button>
+        </div>
+        <div class="inner-panel" id="panel-trace"></div>
+        <div class="inner-panel" id="panel-tool-calls" hidden></div>
+        <div class="inner-panel" id="panel-events" hidden></div>
+      </div>
+    </section>
+
+    <!-- =================== TRANSACTIONS =================== -->
+    <section id="transactions" class="tab-panel">
+      <h1>Transactions Summary</h1>
+      <p class="muted">
+        Roll-up of all agent-processed invoices. Click any top-volume program to
+        see how mixed-currency invoices are converted and checked against each
+        facility limit.
+      </p>
+      <div class="stat-grid" id="tx-stat-grid"></div>
+      <div class="grid-2">
+        <div class="card">
+          <h2>By Status</h2>
+          <table class="data-table" id="tx-status-table"></table>
+        </div>
+        <div class="card">
+          <h2>By Product</h2>
+          <table class="data-table" id="tx-product-table"></table>
+        </div>
+      </div>
+      <div class="card">
+        <h2>By Currency</h2>
+        <table class="data-table" id="tx-currency-table"></table>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h2>Top Programs by Volume</h2>
+          <span class="muted">Click a row for a facility-limit explanation</span>
+        </div>
+        <table class="data-table" id="tx-top-programs-table">
+          <thead><tr>
+            <th>Program</th><th>Product</th><th>Buyer</th><th>Seller</th>
+            <th>Invoices</th><th>Volume (USD)</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h2>Recent Invoices</h2>
+          <span class="muted">Newest first</span>
+        </div>
+        <table class="data-table" id="tx-recent-table">
+          <thead><tr>
+            <th>#</th><th>Invoice</th><th>Seller</th><th>Buyer</th>
+            <th>Product</th><th>Amount</th><th>USD</th><th>Status</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card" id="facility-card" hidden>
+        <h2 id="facility-card-title">Facility Limit Explanation</h2>
+        <div id="facility-explanation"></div>
+      </div>
+    </section>
+
+    <!-- =================== AGENT GRAPH =================== -->
+    <section id="graph" class="tab-panel">
+      <h1>LangGraph — Agent Topology</h1>
+      <p class="muted">Every invoice traverses this state machine. Nodes that made decisions in the last run are highlighted.</p>
+      <div class="card">
+        <pre id="graph-ascii" class="ascii-graph"></pre>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h2>Agents</h2>
+          <table class="data-table" id="agents-table"></table>
+        </div>
+        <div class="card">
+          <h2>StructuredTools</h2>
+          <table class="data-table" id="tools-table"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== AGENT CONSOLE =================== -->
+    <section id="agents" class="tab-panel">
+      <h1>Agent Activity Console</h1>
+      <div class="filters">
+        <label>Agent
+          <select id="filter-agent">
+            <option value="">All</option>
+            <option>orchestrator</option>
+            <option>onboarding_agent</option>
+            <option>underwriter_agent</option>
+            <option>credit_limit_agent</option>
+            <option>transaction_agent</option>
+            <option>review_agent</option>
+          </select>
+        </label>
+        <label>Severity
+          <select id="filter-severity">
+            <option value="">All</option>
+            <option>INFO</option><option>DECISION</option>
+            <option>WARN</option><option>ERROR</option>
+          </select>
+        </label>
+        <button id="refresh-events" class="ghost">Refresh</button>
+      </div>
+      <div id="event-list" class="event-feed full"></div>
+    </section>
+
+    <!-- =================== PROGRAMS =================== -->
+    <section id="programs" class="tab-panel">
+      <h1>Programs</h1>
+      <p class="muted">Newest first. Click a row to view the buyer, or <em>Explain</em> to see the facility math.</p>
+      <table class="data-table" id="programs-table">
+        <thead><tr>
+          <th>ID</th><th>Name</th><th>Product</th>
+          <th>Buyer</th><th>Seller</th>
+          <th>Limit (USD)</th><th>Used (USD)</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="card" id="programs-facility-card" hidden>
+        <h2 id="programs-facility-title">Facility Limit Explanation</h2>
+        <div id="programs-facility-body"></div>
+      </div>
+    </section>
+
+    <!-- =================== COMPANIES =================== -->
+    <section id="companies" class="tab-panel">
+      <h1>Companies</h1>
+      <p class="muted">Search the roster and drill into a counterparty's rating, spread and hierarchy.</p>
+      <div class="filters">
+        <label>Search<input type="text" id="company-search" placeholder="Name..." /></label>
+        <label>Role
+          <select id="company-role">
+            <option value="">All roles</option>
+            <option value="BUYER">Buyer</option>
+            <option value="SELLER">Seller</option>
+          </select>
+        </label>
+        <label>Rating
+          <select id="company-rating">
+            <option value="">All ratings</option>
+            <option>AAA</option><option>AA</option><option>A</option>
+            <option>BBB</option><option>BB</option><option>B</option><option>CCC</option>
+          </select>
+        </label>
+        <label>Sort by
+          <select id="company-sort">
+            <option value="name">Name (A-Z)</option>
+            <option value="rating">Rating (best first)</option>
+            <option value="revenue">Revenue (high to low)</option>
+          </select>
+        </label>
+        <div class="filter-spacer"></div>
+        <span id="company-count" class="muted"></span>
+      </div>
+      <div class="grid-companies">
+        <div class="card table-wrap">
+          <table class="data-table" id="companies-table">
+            <thead><tr>
+              <th>Name</th><th>Rating</th><th>Spread</th>
+              <th>Revenue</th><th>Role</th><th>Industry</th>
+              <th>Country</th><th>Parent</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card" id="company-detail-card">
+          <p class="muted">Select a company to see its hierarchy, programs and credit profile.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">SCF Wonder · LangChain tools orchestrated by a LangGraph state machine · synthetic data only</footer>
+
+  <!-- =================== ONBOARDING MODAL =================== -->
+  <div class="modal-backdrop" id="onboard-modal" hidden>
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="onboard-title">Onboard new company</h2>
+        <button type="button" class="ghost close-btn" id="onboard-cancel" aria-label="Close">✕</button>
+      </div>
+      <p class="muted">
+        The Onboarding Agent will create the company, then hand off to the
+        Underwriter and Credit Limit agents — all inside the graph.
+      </p>
+      <form id="onboard-form" class="form-grid">
+        <input type="hidden" name="side" id="onboard-side" />
+        <label><span>Company name</span><input type="text" name="name" id="onboard-name" required /></label>
+        <label><span>Role</span>
+          <select name="role" id="onboard-role">
+            <option value="BOTH">Both (buyer and seller)</option>
+            <option value="SELLER">Seller</option>
+            <option value="BUYER">Buyer</option>
+          </select>
+        </label>
+        <label><span>Operating country</span><select name="country" id="onboard-country" required></select></label>
+        <label><span>Industry</span><select name="industry" id="onboard-industry"></select></label>
+        <label><span>Avg. annual revenue (USD)</span>
+          <input type="number" name="annual_revenue_usd" id="onboard-revenue" min="1" step="1000" required />
+        </label>
+        <label><span>Years operated</span>
+          <input type="number" name="years_operated" id="onboard-years" min="0" max="200" required />
+        </label>
+        <label class="span-2"><span>Parent company (optional)</span>
+          <input type="text" name="parent_name" id="onboard-parent" placeholder="Leave blank if none" />
+        </label>
+        <div class="form-actions span-2">
+          <button type="button" class="ghost" id="onboard-back">Cancel</button>
+          <button type="submit" class="primary" id="onboard-submit">Run Underwriter Agent</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
