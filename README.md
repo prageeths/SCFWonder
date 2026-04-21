@@ -115,14 +115,55 @@ audit trail of *every* decision.
 # 1. Install deps
 pip install -r requirements.txt
 
-# 2. Seed (~572 companies, ~1,560 programs, 12,000 invoices)
+# 2. (Optional) Turn on LLM-backed agent reasoning
+cp .env.example .env
+# then edit .env and paste your OPENAI_API_KEY
+# When no key is present, every agent falls back to its deterministic rules
+# and the dashboard still works identically.
+
+# 3. Seed (~572 companies, ~1,560 programs, 12,000 invoices)
 python -m scripts.seed        # or: python -m scripts.seed 25000
 
-# 3. Start
+# 4. Start
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# 4. Open http://localhost:8000/
+# 5. Open http://localhost:8000/
 ```
+
+### LLM wiring
+
+When `OPENAI_API_KEY` is set (via `.env` or environment variable):
+
+* The Orchestrator agent writes a 2–4 sentence intake summary that shows at
+  the top of the Agent Flow Result card.
+* The Onboarding agent writes a short rationale paragraph that explains the
+  new counterparty's rating drivers.
+* The Underwriter agent adds a banker-style memo to every `PROGRAM_APPROVED`
+  and `PROGRAM_DECLINED` decision.
+* The Review agent explains every TEMP_INCREASE / DENY decision.
+
+All LLM prompts are centralised in `app/llm.py` — one system prompt per
+agent persona, with explicit `ABSOLUTE RULES` the model cannot override.
+Structured output is enforced via `ChatOpenAI.with_structured_output(...)`
+so the LLM never free-forms around a guardrail.
+
+### Guardrails
+
+1. **Program funding cap at $100,000,000.** Enforced by
+   `PROGRAM_FUNDING_HARD_CEILING_USD` in `app/config.py`, clamped in
+   `underwriting_tools.tool_decide_new_program`, honoured by
+   `review_tools.tool_decide_overage` on any temporary increase, and
+   applied by the seeder. Configurable via `WONDER_PROGRAM_MAX_USD` if you
+   need to experiment.
+2. **Hierarchical facility invariant.** After every reservation the
+   platform walks up the buyer AND seller trees and verifies that subtree
+   utilisation stays ≤ the ancestor's GLOBAL and product limits. If a
+   reservation would violate the invariant it is rolled back and the
+   invoice is REJECTED.
+3. **SCF Marvel parity.** Hierarchical credit limits, per-product
+   sub-limits, bilateral program limits, multi-currency FX normalisation,
+   dynamic risk pricing, facility-limit explainability and the full
+   dashboard UX are all preserved.
 
 ## API highlights
 

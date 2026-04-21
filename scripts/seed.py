@@ -16,7 +16,10 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from sqlalchemy.orm import Session  # noqa: E402
 
 from app import models  # noqa: E402
-from app.config import BASE_RATE, FX_TO_USD, PRODUCT_FACTORING, PRODUCT_REVERSE_FACTORING, SUPPORTED_CURRENCIES  # noqa: E402
+from app.config import (  # noqa: E402
+    BASE_RATE, FX_TO_USD, PRODUCT_FACTORING, PRODUCT_REVERSE_FACTORING,
+    PROGRAM_FUNDING_HARD_CEILING_USD, SUPPORTED_CURRENCIES,
+)
 from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.tools._common import log_event  # noqa: E402
 from app.tools.credit_limit_tools import tool_ensure_limits  # noqa: E402
@@ -298,7 +301,9 @@ def _build_programs(db: Session, buyer_pool: List[models.Company],
         seller_cl = next((cl for cl in seller.credit_limits if cl.product == product), None)
         if not buyer_cl or not seller_cl:
             continue
-        limit = max(250_000.0, round(min(buyer_cl.limit_usd, seller_cl.limit_usd) * rng.uniform(0.05, 0.25), 2))
+        # Spec §1 — program funding limit must stay at or below $100M.
+        raw_limit = min(buyer_cl.limit_usd, seller_cl.limit_usd) * rng.uniform(0.05, 0.25)
+        limit = max(250_000.0, round(min(raw_limit, PROGRAM_FUNDING_HARD_CEILING_USD), 2))
         prog = models.Program(
             name=f"{seller.name} → {buyer.name} ({product})",
             buyer_id=buyer.id, seller_id=seller.id, product=product,

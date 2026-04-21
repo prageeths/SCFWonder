@@ -1,8 +1,18 @@
-"""SCF Wonder — global configuration."""
+"""SCF Wonder — global configuration.
+
+Reads a local `.env` file (if present) so the OpenAI API key is never
+baked into source. See `.env.example` for the full list of variables.
+"""
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+try:  # optional: the app still starts without the package installed
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except Exception:  # pragma: no cover
+    pass
 
 APP_NAME = "SCF Wonder"
 APP_TAGLINE = "LangGraph-powered Supply Chain Finance"
@@ -16,6 +26,30 @@ DATABASE_URL = os.environ.get("WONDER_DB_URL", f"sqlite:///{DEFAULT_DB_PATH}")
 
 # Base rate (2% annualised, decimal form).
 BASE_RATE = float(os.environ.get("WONDER_BASE_RATE", "0.02"))
+
+# LLM wiring — optional. When OPENAI_API_KEY is absent, every agent
+# falls back to its deterministic rule-engine behaviour.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip() or None
+LLM_MODEL = os.environ.get("WONDER_LLM_MODEL", "gpt-4o-2024-11-20")
+LLM_TEMPERATURE = float(os.environ.get("WONDER_LLM_TEMPERATURE", "0.1"))
+LLM_REQUEST_TIMEOUT = float(os.environ.get("WONDER_LLM_TIMEOUT", "30"))
+
+
+def llm_enabled() -> bool:
+    return bool(OPENAI_API_KEY)
+
+
+# -------- Guardrails (spec §1-§3 in the user request) --------
+
+# Spec §1 — no single Program may be funded above this ceiling.
+PROGRAM_MAX_FUNDING_LIMIT_USD = float(
+    os.environ.get("WONDER_PROGRAM_MAX_USD", "100_000_000")
+)
+
+# A new program's proposed limit is clamped to this ceiling by the
+# Underwriter agent. Temporary increases by the Review agent are also
+# capped at this ceiling.
+PROGRAM_FUNDING_HARD_CEILING_USD = PROGRAM_MAX_FUNDING_LIMIT_USD
 
 # Currencies + FX snapshot (to USD).
 SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "CAD", "MXN", "BRL", "COP", "JPY"]

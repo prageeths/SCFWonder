@@ -140,9 +140,41 @@ def tool_hierarchical_headroom(db: Session, *, company_id: int, product: str) ->
     return {"ok": True, "headroom_usd": round(worst, 2), "breakdown": breakdown}
 
 
+def _validate_hierarchy_invariant(
+    db: Session, company: models.Company, product: Optional[str]
+) -> tuple[bool, Optional[str]]:
+    """Spec §2 — at every ancestor, the subtree utilisation (GLOBAL and
+    product-scoped) must stay at or below that ancestor's limit.
+
+    Returns (ok, violation_description).
+    """
+    from ._common import ancestors
+
+    for ancestor in ancestors(company):
+        for kind in ([product] if product else []) + [GLOBAL]:
+            if kind is None:
+                continue
+            cl = db.query(models.CreditLimit).filter(
+                models.CreditLimit.company_id == ancestor.id,
+                models.CreditLimit.product == kind,
+            ).one_or_none()
+            if cl is None:
+                continue
+            used = _subtree_utilisation(
+                db, ancestor, None if kind == GLOBAL else kind
+            )
+            if used > cl.limit_usd + 0.005:
+                return False, (
+                    f"Hierarchy invariant violated at {ancestor.name}:{kind}: "
+                    f"subtree utilisation ${used:,.2f} > limit ${cl.limit_usd:,.2f}"
+                )
+    return True, None
+
+
 def tool_reserve_limits(db: Session, *, invoice_id: int) -> dict:
     """Reserve the invoice amount against the program + both parties' GLOBAL and
-    product limits. Called after an approval decision."""
+    product limits. After reservation, verify the hierarchical invariant holds
+    on both sides (spec §2); roll back and return an error if it doesn't."""
     invoice = db.query(models.Invoice).get(invoice_id)
     if invoice is None:
         return {"ok": False, "error": f"Unknown invoice {invoice_id}"}
@@ -150,20 +182,12 @@ def tool_reserve_limits(db: Session, *, invoice_id: int) -> dict:
     amount = invoice.amount_usd
     product = invoice.product
 
-    if invoice.program_id:
-        program = db.query(models.Program).get(invoice.program_id)
-        if program is not None:
-            program.utilised_usd = round(program.utilised_usd + amount, 2)
-            log_event(
-                db, agent="credit_limit_agent", action="PROGRAM_UTILISATION_BUMPED",
-                node="credit_limit_agent",
-                message=(
-                    f"{program.name}: +${amount:,.0f} "
-                    f"(used ${program.utilised_usd:,.0f}/${program.credit_limit_usd:,.0f})"
-                ),
-                invoice_id=invoice.id, program_id=program.id,
-            )
-
+    # --- snapshot state for rollback on invariant failure ---
+    program = db.query(models.Program).get(invoice.program_id) if invoice.program_id else None
+    snapshot = {
+        "program": (program.id, program.utilised_usd) if program else None,
+        "limits": [],
+    }
     for company in (invoice.buyer, invoice.seller):
         for kind in (product, GLOBAL):
             cl = db.query(models.CreditLimit).filter(
@@ -171,12 +195,51 @@ def tool_reserve_limits(db: Session, *, invoice_id: int) -> dict:
                 models.CreditLimit.product == kind,
             ).one_or_none()
             if cl is not None:
+                snapshot["limits"].append((cl.id, cl.utilised_usd))
                 cl.utilised_usd = round(cl.utilised_usd + amount, 2)
+    if program is not None:
+        program.utilised_usd = round(program.utilised_usd + amount, 2)
     db.flush()
+
+    # --- spec §2 hierarchical invariant check ---
+    ok_buyer, msg_buyer = _validate_hierarchy_invariant(db, invoice.buyer, product)
+    ok_seller, msg_seller = _validate_hierarchy_invariant(db, invoice.seller, product)
+    if not (ok_buyer and ok_seller):
+        # roll back
+        if snapshot["program"]:
+            pid, used = snapshot["program"]
+            db.query(models.Program).filter_by(id=pid).update({"utilised_usd": used})
+        for cl_id, used in snapshot["limits"]:
+            db.query(models.CreditLimit).filter_by(id=cl_id).update({"utilised_usd": used})
+        db.flush()
+
+        violation = msg_buyer or msg_seller or "hierarchy violation"
+        log_event(
+            db, agent="credit_limit_agent", action="HIERARCHY_INVARIANT_ROLLBACK",
+            node="credit_limit_agent", severity="WARN",
+            message=f"Reservation rolled back: {violation}",
+            invoice_id=invoice.id, program_id=program.id if program else None,
+        )
+        return {"ok": False, "error": violation}
+
+    if program is not None:
+        log_event(
+            db, agent="credit_limit_agent", action="PROGRAM_UTILISATION_BUMPED",
+            node="credit_limit_agent",
+            message=(
+                f"{program.name}: +${amount:,.0f} "
+                f"(used ${program.utilised_usd:,.0f}/${program.credit_limit_usd:,.0f})"
+            ),
+            invoice_id=invoice.id, program_id=program.id,
+        )
+
     log_event(
         db, agent="credit_limit_agent", action="LIMITS_RESERVED",
         node="credit_limit_agent",
-        message=f"Reserved ${amount:,.0f} against buyer/seller limits",
+        message=(
+            f"Reserved ${amount:,.0f} against buyer/seller limits "
+            f"(hierarchy invariant verified)"
+        ),
         invoice_id=invoice.id,
     )
     return {"ok": True, "reserved_usd": amount}

@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 from . import models, schemas
 from .config import (
     ALLOWED_TENORS, APP_NAME, APP_TAGLINE, BASE_RATE, COUNTRIES, FX_TO_USD,
-    INDUSTRIES, PRODUCT_FACTORING, PRODUCT_REVERSE_FACTORING, RATING_LADDER,
-    SUPPORTED_CURRENCIES,
+    INDUSTRIES, LLM_MODEL, PRODUCT_FACTORING, PRODUCT_REVERSE_FACTORING,
+    PROGRAM_FUNDING_HARD_CEILING_USD, RATING_LADDER, SUPPORTED_CURRENCIES,
+    llm_enabled,
 )
 from .database import SessionLocal, init_db
 from .graph import run_invoice_flow
@@ -84,6 +85,12 @@ def meta() -> dict:
         "industries": INDUSTRIES,
         "rating_ladder": RATING_LADDER,
         "fx_to_usd": FX_TO_USD,
+        "guardrails": {
+            "program_funding_max_usd": PROGRAM_FUNDING_HARD_CEILING_USD,
+            "hierarchy_invariant_enforced": True,
+            "llm_enabled": llm_enabled(),
+            "llm_model": LLM_MODEL if llm_enabled() else None,
+        },
         "as_of": _dt.datetime.utcnow().isoformat(),
     }
 

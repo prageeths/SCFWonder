@@ -13,8 +13,13 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import (
     COUNTRY_RISK, INDUSTRY_RISK, NAMED_MAJORS_AA, NAMED_MAJORS_AAA,
-    RATING_BANDS, RATING_LADDER, THRESHOLD_AA_REVENUE, THRESHOLD_AAA_REVENUE,
-    THRESHOLD_B_MAX_REVENUE,
+    PROGRAM_FUNDING_HARD_CEILING_USD, RATING_BANDS, RATING_LADDER,
+    THRESHOLD_AA_REVENUE, THRESHOLD_AAA_REVENUE, THRESHOLD_B_MAX_REVENUE,
+    llm_enabled,
+)
+from ..llm import (
+    SYSTEM_UNDERWRITER, UnderwriterRecommendation,
+    facts_block, safe_structured_call,
 )
 from ._common import log_event
 
@@ -198,17 +203,29 @@ def tool_build_risk_profile(db: Session, *, company_id: int) -> dict:
     }
 
 
+def _clamp_program_limit(raw_usd: float) -> tuple[float, bool]:
+    """Apply the hard $100M program ceiling (spec §1).
+
+    Returns (clamped_usd, was_clamped).
+    """
+    if raw_usd > PROGRAM_FUNDING_HARD_CEILING_USD:
+        return PROGRAM_FUNDING_HARD_CEILING_USD, True
+    return round(raw_usd, 2), False
+
+
 def tool_decide_new_program(
     db: Session, *, invoice_id: int, requested_limit_usd: float
 ) -> dict:
     """Open an underwriting case for a brand-new buyer/seller pair and
     either approve it (creating a Program) or decline.
 
-    Decision rules (transparent, reproducible):
+    Policy (deterministic source of truth — LLM *cannot* override):
       * Both parties must have a RiskProfile.
-      * Both parties must be rated at least BB (buyer ≤ BBB, seller ≤ BB).
+      * Both parties must be rated buyer ≤ BBB and seller ≤ BB.
       * If approved, a new Program row is created sized at
-        max(4 × requested_limit, 5 × invoice.amount_usd).
+        min($100M, max(4 × requested_limit, 5 × invoice.amount_usd)).
+      * If an LLM is configured, it produces a banker-style rationale that
+        is stored alongside the decision — but the numbers are ours.
     """
     invoice: Optional[models.Invoice] = db.query(models.Invoice).get(invoice_id)
     if invoice is None:
@@ -222,26 +239,85 @@ def tool_decide_new_program(
     b_idx, s_idx = RATING_LADDER.index(b_rp.rating), RATING_LADDER.index(s_rp.rating)
     cutoff_buyer = RATING_LADDER.index("BBB")
     cutoff_seller = RATING_LADDER.index("BB")
-    if b_idx > cutoff_buyer or s_idx > cutoff_seller:
+    ratings_ok = (b_idx <= cutoff_buyer and s_idx <= cutoff_seller)
+
+    raw_program_limit = max(requested_limit_usd * 4.0, invoice.amount_usd * 5.0)
+    proposed_limit, clamped = _clamp_program_limit(raw_program_limit)
+
+    # --- optional LLM banker-style rationale ---
+    llm_rec: Optional[UnderwriterRecommendation] = None
+    if llm_enabled():
+        facts = {
+            "invoice": {
+                "amount_usd": invoice.amount_usd,
+                "currency": invoice.currency,
+                "product": invoice.product,
+                "tenor_days": invoice.tenor_days,
+            },
+            "buyer": {
+                "name": buyer.name, "country": buyer.country,
+                "industry": buyer.industry,
+                "annual_revenue_usd": buyer.annual_revenue_usd,
+                "rating": b_rp.rating, "pd_1y": b_rp.pd_1y,
+                "credit_spread": b_rp.credit_spread,
+                "tenure_years": b_rp.tenure_years,
+            },
+            "seller": {
+                "name": seller.name, "country": seller.country,
+                "industry": seller.industry,
+                "annual_revenue_usd": seller.annual_revenue_usd,
+                "rating": s_rp.rating, "pd_1y": s_rp.pd_1y,
+                "credit_spread": s_rp.credit_spread,
+                "tenure_years": s_rp.tenure_years,
+            },
+            "policy_rating_cutoffs": {"buyer": "BBB", "seller": "BB"},
+            "program_funding_ceiling_usd": PROGRAM_FUNDING_HARD_CEILING_USD,
+            "indicative_program_limit_usd_before_ceiling": raw_program_limit,
+            "deterministic_decision": "APPROVE" if ratings_ok else "DECLINE",
+        }
+        human = (
+            "Write a banker-style memo recommending APPROVE or DECLINE for the "
+            "new bilateral program described below. Respect the rating cutoffs "
+            "and the $100M ceiling. If you recommend APPROVE, propose a limit "
+            f"no greater than ${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f}.\n\n"
+            + facts_block(facts)
+        )
+        llm_rec = safe_structured_call(
+            SYSTEM_UNDERWRITER, human, UnderwriterRecommendation,
+            label="underwriter_decide_new_program",
+        )
+
+    # Deterministic ratings-based veto always wins.
+    if not ratings_ok:
         reason = (
             f"Declined: buyer={b_rp.rating} (cutoff BBB), "
             f"seller={s_rp.rating} (cutoff BB)."
         )
+        if llm_rec is not None:
+            reason += f" LLM rationale: {llm_rec.rationale}"
         invoice.status = "REJECTED"
         invoice.decision_reason = reason
         log_event(
             db, agent="underwriter_agent", action="PROGRAM_DECLINED",
             node="underwriter_agent", severity="DECISION",
             message=reason, invoice_id=invoice.id,
+            payload={"llm_decision": llm_rec.decision if llm_rec else None,
+                     "llm_rationale": llm_rec.rationale if llm_rec else None},
         )
-        return {"approved": False, "reason": reason}
+        return {"approved": False, "reason": reason,
+                "llm_rationale": llm_rec.rationale if llm_rec else None}
 
-    program_limit = max(requested_limit_usd * 4.0, invoice.amount_usd * 5.0)
+    # Honour the LLM's numeric recommendation if it's lower than our proposal
+    # (we always pick the *more conservative* value).
+    if llm_rec is not None and llm_rec.decision == "APPROVE":
+        llm_limit, _ = _clamp_program_limit(llm_rec.recommended_program_limit_usd)
+        proposed_limit = min(proposed_limit, llm_limit) if llm_limit > 0 else proposed_limit
+
     program = models.Program(
         name=f"{seller.name} → {buyer.name} ({invoice.product})",
         buyer_id=buyer.id, seller_id=seller.id,
         product=invoice.product,
-        credit_limit_usd=round(program_limit, 2),
+        credit_limit_usd=round(proposed_limit, 2),
         base_currency=invoice.currency,
         grace_period_days=invoice.grace_period_days or 5,
         status="ACTIVE",
@@ -250,19 +326,34 @@ def tool_decide_new_program(
     db.flush()
     invoice.program_id = program.id
 
+    msg = (
+        f"Approved new program {program.id}: ${program.credit_limit_usd:,.0f} "
+        f"bilateral limit for {program.name}"
+    )
+    if clamped:
+        msg += f" (clamped from ${raw_program_limit:,.0f} to $100M ceiling)"
+    if llm_rec is not None:
+        msg += f" | LLM: {llm_rec.rationale}"
+
     log_event(
         db, agent="underwriter_agent", action="PROGRAM_APPROVED",
         node="underwriter_agent", severity="DECISION",
-        message=(
-            f"Approved new program {program.id}: ${program.credit_limit_usd:,.0f} "
-            f"bilateral limit for {program.name}"
-        ),
+        message=msg,
         invoice_id=invoice.id, program_id=program.id,
+        payload={
+            "raw_limit_usd": raw_program_limit,
+            "final_limit_usd": program.credit_limit_usd,
+            "clamped_to_ceiling": clamped,
+            "llm_decision": llm_rec.decision if llm_rec else None,
+            "llm_rationale": llm_rec.rationale if llm_rec else None,
+        },
     )
     return {
         "approved": True,
         "program_id": program.id,
         "program_limit_usd": program.credit_limit_usd,
+        "clamped_to_ceiling": clamped,
+        "llm_rationale": llm_rec.rationale if llm_rec else None,
     }
 
 

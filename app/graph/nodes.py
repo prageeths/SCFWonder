@@ -25,7 +25,14 @@ from typing import Any, Callable, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import BASE_RATE, FX_TO_USD, PRODUCTS, SUPPORTED_CURRENCIES, ALLOWED_TENORS
+from ..config import (
+    BASE_RATE, FX_TO_USD, PRODUCTS, PROGRAM_FUNDING_HARD_CEILING_USD,
+    SUPPORTED_CURRENCIES, ALLOWED_TENORS, llm_enabled,
+)
+from ..llm import (
+    SYSTEM_ONBOARDING, SYSTEM_ORCHESTRATOR, OnboardingSummary,
+    OrchestratorSummary, facts_block, safe_structured_call,
+)
 from ..tools._common import find_company_by_name, log_event
 from ..tools.company_tools import tool_lookup_company, tool_onboard_company
 from ..tools.underwriting_tools import tool_build_risk_profile, tool_decide_new_program
@@ -140,15 +147,38 @@ def make_orchestrator_node(db: Session) -> Callable[[WonderState], Dict[str, Any
             f"Received invoice intake: {seller_name} → {buyer_name} "
             f"{amount:,.2f} {currency} (tenor {tenor}d, {product})"
         )
+
+        llm_summary = None
+        if llm_enabled():
+            facts = {
+                "seller": {"name": seller_name, "found": s_lookup.get("found", False)},
+                "buyer":  {"name": buyer_name,  "found": b_lookup.get("found", False)},
+                "amount": amount, "currency": currency, "product": product,
+                "tenor_days": tenor, "grace_period_days": req.get("grace_period_days") or 0,
+                "has_new_seller_payload": bool(req.get("new_seller")),
+                "has_new_buyer_payload":  bool(req.get("new_buyer")),
+            }
+            rec = safe_structured_call(
+                SYSTEM_ORCHESTRATOR,
+                "Summarise the intake and recommend the next downstream agent.\n\n"
+                + facts_block(facts),
+                OrchestratorSummary,
+                label="orchestrator_summary",
+            )
+            if rec is not None:
+                llm_summary = rec.summary
+                msg = f"{msg}. Orchestrator: {rec.summary}"
+
         log_event(
             db, agent="orchestrator", action="INVOICE_RECEIVED",
             node="orchestrator", message=msg,
             payload={"seller_name": seller_name, "buyer_name": buyer_name,
                      "amount": amount, "currency": currency, "product": product,
-                     "tenor_days": tenor},
+                     "tenor_days": tenor, "llm_summary": llm_summary},
         )
         updates.update(_append_trace(
             "orchestrator", msg, amount=amount, currency=currency, tenor=tenor,
+            llm_summary=llm_summary,
         ))
         updates["next_step"] = "onboard_seller"  # always flow through onboarding branch
         return updates
@@ -208,6 +238,26 @@ def make_onboarding_node(db: Session) -> Callable[[WonderState], Dict[str, Any]]
                     "args": {"company_id": cid, "product": product}, "result": lim,
                     "timestamp": _dt.datetime.utcnow().isoformat(),
                 })
+                # LLM narration of what just happened.
+                if llm_enabled():
+                    narration = safe_structured_call(
+                        SYSTEM_ONBOARDING,
+                        "Write a 1-3 short paragraph rationale for the dashboard.\n\n"
+                        + facts_block({
+                            "onboard_payload": pending,
+                            "rating_profile": rp,
+                        }),
+                        OnboardingSummary,
+                        label="onboarding_narration",
+                    )
+                    if narration is not None:
+                        updates["trace"].append({
+                            "node": "onboarding_agent",
+                            "timestamp": _dt.datetime.utcnow().isoformat(),
+                            "message": narration.rationale,
+                            "payload": {"side": side, "company_id": cid,
+                                        "llm_narration": True},
+                        })
                 return cid
             return None
 
@@ -380,18 +430,30 @@ def make_underwrite_program_node(db: Session) -> Callable[[WonderState], Dict[st
             "timestamp": _dt.datetime.utcnow().isoformat(),
         }]
         if res.get("approved"):
+            clamped = res.get("clamped_to_ceiling")
+            llm_rationale = res.get("llm_rationale")
+            msg = f"Program approved with ${res['program_limit_usd']:,.0f} bilateral limit"
+            if clamped:
+                msg += f" (clamped to ${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f} ceiling)"
+            if llm_rationale:
+                msg += f" · LLM: {llm_rationale}"
             return {
                 "tool_calls": tc,
                 "program_id": res["program_id"],
                 **_append_trace(
-                    "underwriter_agent",
-                    f"Program approved with ${res['program_limit_usd']:,.0f} bilateral limit.",
+                    "underwriter_agent", msg,
+                    clamped_to_ceiling=clamped,
+                    llm_rationale=llm_rationale,
                 ),
                 "next_step": "limit_check",
             }
         return {
             "tool_calls": tc,
-            **_append_trace("underwriter_agent", res.get("reason", "declined")),
+            **_append_trace(
+                "underwriter_agent",
+                res.get("reason", "declined"),
+                llm_rationale=res.get("llm_rationale"),
+            ),
             "next_step": "rejected",
             "status": "REJECTED",
             "decision_reason": res.get("reason"),
@@ -528,6 +590,30 @@ def make_approve_node(db: Session) -> Callable[[WonderState], Dict[str, Any]]:
              "timestamp": _dt.datetime.utcnow().isoformat()},
         ]
         invoice = db.query(models.Invoice).get(invoice_id)
+
+        # Spec §2 — if the hierarchy invariant was violated during reservation,
+        # the reservation already rolled back; reject the invoice.
+        if not reserve_res.get("ok"):
+            reason = (
+                f"Hierarchy invariant violation at reservation time: "
+                f"{reserve_res.get('error')}."
+            )
+            invoice.status = "REJECTED"
+            invoice.decision_reason = reason
+            log_event(
+                db, agent="credit_limit_agent", action="RESERVATION_FAILED",
+                node="credit_limit_agent", severity="DECISION",
+                message=reason, invoice_id=invoice.id,
+                program_id=invoice.program_id,
+            )
+            return {
+                "tool_calls": tc,
+                **_append_trace("credit_limit_agent", reason),
+                "status": "REJECTED",
+                "decision_reason": reason,
+                "next_step": "done",
+            }
+
         invoice.status = "FUNDED"
         invoice.decision_reason = (
             f"Approved at base_rate={price_res['base_rate']:.2%} + "
