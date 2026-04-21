@@ -73,20 +73,38 @@ def tool_decide_overage(db: Session, *, invoice_id: int, overage_usd: float) -> 
         )
 
     if would_breach_ceiling:
-        reason = (
-            f"Denied: temp increase of ${overage_usd:,.0f} would push program "
-            f"limit above the ${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f} platform "
-            f"ceiling."
-        )
+        proposed = program.credit_limit_usd + overage_usd if program else overage_usd
+        reason = "\n".join([
+            "Rejected — temporary increase would breach the platform ceiling.",
+            (
+                f"• Invoice: ${inv.amount_usd:,.2f} USD  |  "
+                f"Program headroom: "
+                f"${(program.credit_limit_usd - program.utilised_usd):,.2f}."
+                if program else f"• Invoice: ${inv.amount_usd:,.2f} USD."
+            ),
+            f"• Overage requested: ${overage_usd:,.2f}.",
+            (
+                f"• Current program limit: ${program.credit_limit_usd:,.2f}; "
+                f"proposed after increase: ${proposed:,.2f}."
+                if program else ""
+            ),
+            (
+                f"• Platform ceiling: ${PROGRAM_FUNDING_HARD_CEILING_USD:,.2f} — "
+                f"proposed limit would be ${proposed - PROGRAM_FUNDING_HARD_CEILING_USD:,.2f} over."
+            ),
+        ])
+        reason = "\n".join(line for line in reason.splitlines() if line.strip())
         if llm_rec is not None:
-            reason += f" LLM rationale: {llm_rec.rationale}"
+            reason += f"\n• Review LLM memo: {llm_rec.rationale}"
         inv.status = "REJECTED"
         inv.decision_reason = reason
         log_event(
             db, agent="review_agent", action="TEMP_INCREASE_DENIED_CEILING",
             node="review_agent", severity="DECISION", message=reason,
             invoice_id=inv.id, program_id=program.id if program else None,
-            payload={"llm_rationale": llm_rec.rationale if llm_rec else None},
+            payload={"llm_rationale": llm_rec.rationale if llm_rec else None,
+                     "proposed_new_limit_usd": proposed,
+                     "platform_ceiling_usd": PROGRAM_FUNDING_HARD_CEILING_USD},
         )
         return {"decision": "DENIED", "reason": reason,
                 "llm_rationale": llm_rec.rationale if llm_rec else None}
@@ -109,19 +127,39 @@ def tool_decide_overage(db: Session, *, invoice_id: int, overage_usd: float) -> 
         return {"decision": "TEMP_INCREASE", "reason": reason,
                 "llm_rationale": llm_rec.rationale if llm_rec else None}
 
-    reason = (
-        f"Denied temporary increase: overage ${overage_usd:,.0f} > 15% of program "
-        f"limit (${threshold:,.0f}) and ratings below BBB."
-    )
+    over_pct = (overage_usd / program.credit_limit_usd * 100.0) if program and program.credit_limit_usd else 0.0
+    reason = "\n".join([
+        "Rejected — temporary program-limit increase denied.",
+        f"• Invoice: ${inv.amount_usd:,.2f} USD.",
+        (
+            f"• Program: '{program.name}' with ${program.credit_limit_usd:,.2f} "
+            f"limit (${program.utilised_usd:,.2f} used)."
+            if program else "• No active program."
+        ),
+        f"• Overage: ${overage_usd:,.2f} — {over_pct:.1f}% of program limit.",
+        f"• Auto-approve tolerance is 15% (${threshold:,.2f}) — exceeded.",
+        (
+            f"• Ratings: buyer {b_rp.rating if b_rp else '—'}, "
+            f"seller {s_rp.rating if s_rp else '—'} — at least one is below BBB."
+        ),
+    ])
     if llm_rec is not None:
-        reason += f" LLM rationale: {llm_rec.rationale}"
+        reason += f"\n• Review LLM memo: {llm_rec.rationale}"
     inv.status = "REJECTED"
     inv.decision_reason = reason
     log_event(
         db, agent="review_agent", action="TEMP_INCREASE_DENIED",
         node="review_agent", severity="DECISION", message=reason,
         invoice_id=inv.id, program_id=program.id if program else None,
-        payload={"llm_rationale": llm_rec.rationale if llm_rec else None},
+        payload={
+            "invoice_usd": inv.amount_usd,
+            "overage_usd": overage_usd,
+            "overage_pct_of_program_limit": over_pct,
+            "tolerance_threshold_usd": threshold,
+            "buyer_rating": b_rp.rating if b_rp else None,
+            "seller_rating": s_rp.rating if s_rp else None,
+            "llm_rationale": llm_rec.rationale if llm_rec else None,
+        },
     )
     return {"decision": "DENIED", "reason": reason,
             "llm_rationale": llm_rec.rationale if llm_rec else None}

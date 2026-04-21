@@ -664,8 +664,14 @@ function setupForm() {
 
       const inv = data.invoice;
       const bannerClass = inv.status === "REJECTED" ? "summary-banner error" : "summary-banner";
+      // On reject, show the full multi-line decision_reason; on approve, the
+      // one-line summary is enough.
+      const bannerHeader = `${inv.invoice_number} · ${inv.status}`;
+      const bannerBody = inv.status === "REJECTED" && inv.decision_reason
+        ? inv.decision_reason
+        : (inv.decision_reason || data.summary || "");
       $("#decision-summary").innerHTML = `
-        <div class="${bannerClass}">${data.summary}</div>
+        <div class="${bannerClass}"><strong>${bannerHeader}</strong>${bannerBody ? "\n" + bannerBody : ""}</div>
         <div class="kv">
           <div class="k">Invoice</div><div>${inv.invoice_number} <span class="badge ${inv.status}">${inv.status}</span></div>
           <div class="k">Seller → Buyer</div><div>${inv.seller.name} → ${inv.buyer.name}</div>

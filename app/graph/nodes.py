@@ -432,17 +432,34 @@ def make_underwrite_program_node(db: Session) -> Callable[[WonderState], Dict[st
         if res.get("approved"):
             clamped = res.get("clamped_to_ceiling")
             llm_rationale = res.get("llm_rationale")
-            msg = f"Program approved with ${res['program_limit_usd']:,.0f} bilateral limit"
+            joint = res.get("joint_risk_assessment") or {}
+            msg_lines = [
+                f"Program approved with ${res['program_limit_usd']:,.0f} bilateral limit."
+            ]
+            if joint:
+                msg_lines.append(
+                    f"• Joint risk for {joint['product']}: buyer "
+                    f"{joint['buyer_rating']} ({joint['buyer_weight']*100:.0f}% weight), "
+                    f"seller {joint['seller_rating']} "
+                    f"({joint['seller_weight']*100:.0f}% weight) → "
+                    f"combined {joint['combined_rating']}, "
+                    f"blended PD {joint['blended_pd_1y']*100:.2f}%."
+                )
             if clamped:
-                msg += f" (clamped to ${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f} ceiling)"
+                msg_lines.append(
+                    f"• Limit clamped to the "
+                    f"${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f} platform ceiling."
+                )
             if llm_rationale:
-                msg += f" · LLM: {llm_rationale}"
+                msg_lines.append(f"• Underwriter LLM memo: {llm_rationale}")
+            msg = "\n".join(msg_lines)
             return {
                 "tool_calls": tc,
                 "program_id": res["program_id"],
                 **_append_trace(
                     "underwriter_agent", msg,
                     clamped_to_ceiling=clamped,
+                    joint_risk_assessment=joint,
                     llm_rationale=llm_rationale,
                 ),
                 "next_step": "limit_check",
@@ -508,13 +525,53 @@ def make_limit_check_node(db: Session) -> Callable[[WonderState], Dict[str, Any]
         updates["buyer_headroom_usd"] = buyer_head
         updates["seller_headroom_usd"] = seller_head
 
+        def _binding_from(breakdown: Dict[str, float]) -> str:
+            """Pick the key with the smallest headroom — that's the binding constraint."""
+            if not breakdown:
+                return "(no ancestors)"
+            return min(breakdown.items(), key=lambda kv: kv[1])[0]
+
         # Subtree limit breach = hard fail (cannot even go to review).
         if amount > worst_subtree:
-            reason = (
-                f"Hierarchical credit limit exceeded "
-                f"(buyer_headroom=${buyer_head:,.2f}, "
-                f"seller_headroom=${seller_head:,.2f})."
+            binding_side = "buyer" if buyer_head <= seller_head else "seller"
+            binding_head = buyer_head if binding_side == "buyer" else seller_head
+            binding_breakdown = (
+                buyer_res.get("breakdown", {}) if binding_side == "buyer"
+                else seller_res.get("breakdown", {})
             )
+            binding_ancestor = _binding_from(binding_breakdown)
+            shortfall = amount - binding_head
+            used_pct = (
+                100.0 * (1.0 - binding_head / (binding_head + amount))
+                if (binding_head + amount) > 0 else 100.0
+            )
+            reason = "\n".join([
+                "Rejected — hierarchical credit limit exceeded.",
+                (
+                    f"• Invoice: ${amount:,.2f} USD "
+                    f"({invoice.amount:,.2f} {invoice.currency}), "
+                    f"{invoice.product}, tenor {invoice.tenor_days}d."
+                ),
+                (
+                    f"• Buyer subtree headroom: ${buyer_head:,.2f} "
+                    f"(binding at {_binding_from(buyer_res.get('breakdown', {}))})."
+                ),
+                (
+                    f"• Seller subtree headroom: ${seller_head:,.2f} "
+                    f"(binding at {_binding_from(seller_res.get('breakdown', {}))})."
+                ),
+                (
+                    f"• Binding constraint: {binding_side} side at "
+                    f"{binding_ancestor} — only ${binding_head:,.2f} available."
+                ),
+                (
+                    f"• Shortfall: ${shortfall:,.2f} "
+                    f"(invoice is {amount/binding_head*100:,.1f}% of the "
+                    f"available headroom)."
+                    if binding_head > 0
+                    else "• The binding limit has no headroom at all."
+                ),
+            ])
             updates["next_step"] = "rejected"
             updates["status"] = "REJECTED"
             updates["decision_reason"] = reason
@@ -522,6 +579,14 @@ def make_limit_check_node(db: Session) -> Callable[[WonderState], Dict[str, Any]
                 db, agent="credit_limit_agent", action="HARD_LIMIT_BREACH",
                 node="credit_limit_agent", severity="DECISION",
                 message=reason, invoice_id=invoice.id,
+                payload={
+                    "invoice_usd": amount,
+                    "buyer_headroom_usd": buyer_head,
+                    "seller_headroom_usd": seller_head,
+                    "binding_side": binding_side,
+                    "binding_ancestor": binding_ancestor,
+                    "shortfall_usd": shortfall,
+                },
             )
             return updates
 
@@ -532,8 +597,16 @@ def make_limit_check_node(db: Session) -> Callable[[WonderState], Dict[str, Any]
             updates["next_step"] = "review"
             updates.update(_append_trace(
                 "credit_limit_agent",
-                f"Program limit exceeded by ${overage:,.2f}; routing to Review Agent.",
+                "\n".join([
+                    "Program limit exceeded — routing to Review Agent.",
+                    (
+                        f"• Invoice: ${amount:,.2f} USD  |  "
+                        f"Program headroom: ${program_headroom:,.2f}."
+                    ),
+                    f"• Overage: ${overage:,.2f}.",
+                ]),
                 overage_usd=overage,
+                program_headroom_usd=program_headroom,
             ))
             return updates
 
@@ -594,10 +667,15 @@ def make_approve_node(db: Session) -> Callable[[WonderState], Dict[str, Any]]:
         # Spec §2 — if the hierarchy invariant was violated during reservation,
         # the reservation already rolled back; reject the invoice.
         if not reserve_res.get("ok"):
-            reason = (
-                f"Hierarchy invariant violation at reservation time: "
-                f"{reserve_res.get('error')}."
-            )
+            reason = "\n".join([
+                "Rejected — reservation would violate hierarchical facility invariant.",
+                (
+                    f"• Invoice: ${invoice.amount_usd:,.2f} USD "
+                    f"({invoice.amount:,.2f} {invoice.currency}), {invoice.product}."
+                ),
+                f"• Invariant check: {reserve_res.get('error')}.",
+                "• Reservation rolled back; no limits were changed.",
+            ])
             invoice.status = "REJECTED"
             invoice.decision_reason = reason
             log_event(

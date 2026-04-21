@@ -213,6 +213,120 @@ def _clamp_program_limit(raw_usd: float) -> tuple[float, bool]:
     return round(raw_usd, 2), False
 
 
+# ---------------------------------------------------------------------------
+# Joint risk assessment
+# ---------------------------------------------------------------------------
+#
+# A factoring invoice carries buyer AND seller credit risk — but the weight
+# shifts by product:
+#
+#   * FACTORING          — risk is mostly on the BUYER (they pay at maturity).
+#                          Buyer weight = 70%, Seller weight = 30%.
+#   * REVERSE_FACTORING  — risk is mostly on the BUYER (they owe the funder),
+#                          Seller risk (dilution) is secondary.
+#                          Buyer weight = 75%, Seller weight = 25%.
+#
+# The combined score is a PD (probability of default) blended by weight; the
+# combined rating is the *worse* of the two parties (the weakest link) so
+# that a BB seller can't be "averaged away" by an AAA buyer.
+# ---------------------------------------------------------------------------
+
+_PRODUCT_WEIGHTS = {
+    "FACTORING": {"buyer": 0.70, "seller": 0.30},
+    "REVERSE_FACTORING": {"buyer": 0.75, "seller": 0.25},
+}
+
+
+def _joint_risk_assessment(
+    buyer_rp: models.RiskProfile,
+    seller_rp: models.RiskProfile,
+    product: str,
+) -> dict:
+    """Return a product-aware joint risk view of both counterparties."""
+    weights = _PRODUCT_WEIGHTS.get(product, {"buyer": 0.5, "seller": 0.5})
+
+    b_idx = RATING_LADDER.index(buyer_rp.rating)
+    s_idx = RATING_LADDER.index(seller_rp.rating)
+    combined_rating = RATING_LADDER[max(b_idx, s_idx)]  # weaker = higher idx
+
+    # Blended 1y PD. Both are decimal.
+    blended_pd = weights["buyer"] * buyer_rp.pd_1y + weights["seller"] * seller_rp.pd_1y
+
+    # Blended spread — informational only (actual pricing still uses the mean
+    # of the two spreads for BAU consistency with SCF Marvel).
+    blended_spread = (
+        weights["buyer"] * buyer_rp.credit_spread
+        + weights["seller"] * seller_rp.credit_spread
+    )
+
+    cutoff_buyer_rating = "BBB"
+    cutoff_seller_rating = "BB"
+    buyer_ok = b_idx <= RATING_LADDER.index(cutoff_buyer_rating)
+    seller_ok = s_idx <= RATING_LADDER.index(cutoff_seller_rating)
+
+    return {
+        "product": product,
+        "buyer_weight": weights["buyer"],
+        "seller_weight": weights["seller"],
+        "buyer_rating": buyer_rp.rating,
+        "seller_rating": seller_rp.rating,
+        "combined_rating": combined_rating,
+        "buyer_pd_1y": round(buyer_rp.pd_1y, 4),
+        "seller_pd_1y": round(seller_rp.pd_1y, 4),
+        "blended_pd_1y": round(blended_pd, 4),
+        "buyer_spread": round(buyer_rp.credit_spread, 4),
+        "seller_spread": round(seller_rp.credit_spread, 4),
+        "blended_spread": round(blended_spread, 4),
+        "buyer_ok": buyer_ok,
+        "seller_ok": seller_ok,
+        "ratings_ok": (buyer_ok and seller_ok),
+        "cutoff_buyer_rating": cutoff_buyer_rating,
+        "cutoff_seller_rating": cutoff_seller_rating,
+    }
+
+
+def _format_rejection_reason(
+    invoice: models.Invoice, joint: dict,
+) -> str:
+    """Human-readable, numbered rationale for an underwriter decline."""
+    buyer = invoice.buyer
+    seller = invoice.seller
+
+    lines = [
+        "Underwriter declined — joint risk assessment failed.",
+        f"• Invoice: ${invoice.amount_usd:,.2f} USD "
+        f"({invoice.amount:,.2f} {invoice.currency}), {invoice.product}, "
+        f"tenor {invoice.tenor_days}d.",
+        (
+            f"• Buyer {buyer.name}: rating {joint['buyer_rating']} "
+            f"(PD 1y {joint['buyer_pd_1y']*100:.2f}%); "
+            f"required ≤ {joint['cutoff_buyer_rating']} — "
+            f"{'OK' if joint['buyer_ok'] else 'FAIL'}."
+        ),
+        (
+            f"• Seller {seller.name}: rating {joint['seller_rating']} "
+            f"(PD 1y {joint['seller_pd_1y']*100:.2f}%); "
+            f"required ≤ {joint['cutoff_seller_rating']} — "
+            f"{'OK' if joint['seller_ok'] else 'FAIL'}."
+        ),
+        (
+            f"• Joint view for {joint['product']}: buyer weight "
+            f"{joint['buyer_weight']*100:.0f}%, seller weight "
+            f"{joint['seller_weight']*100:.0f}% → "
+            f"combined rating {joint['combined_rating']} "
+            f"(weakest of the two), blended PD "
+            f"{joint['blended_pd_1y']*100:.2f}%."
+        ),
+    ]
+    failing = []
+    if not joint["buyer_ok"]:
+        failing.append(f"buyer must be ≤ {joint['cutoff_buyer_rating']}")
+    if not joint["seller_ok"]:
+        failing.append(f"seller must be ≤ {joint['cutoff_seller_rating']}")
+    lines.append("• Binding cutoff: " + " AND ".join(failing) + ".")
+    return "\n".join(lines)
+
+
 def tool_decide_new_program(
     db: Session, *, invoice_id: int, requested_limit_usd: float
 ) -> dict:
@@ -236,10 +350,8 @@ def tool_decide_new_program(
     if b_rp is None or s_rp is None:
         return {"approved": False, "error": "missing risk profile(s) — profile first"}
 
-    b_idx, s_idx = RATING_LADDER.index(b_rp.rating), RATING_LADDER.index(s_rp.rating)
-    cutoff_buyer = RATING_LADDER.index("BBB")
-    cutoff_seller = RATING_LADDER.index("BB")
-    ratings_ok = (b_idx <= cutoff_buyer and s_idx <= cutoff_seller)
+    joint = _joint_risk_assessment(b_rp, s_rp, invoice.product)
+    ratings_ok = joint["ratings_ok"]
 
     raw_program_limit = max(requested_limit_usd * 4.0, invoice.amount_usd * 5.0)
     proposed_limit, clamped = _clamp_program_limit(raw_program_limit)
@@ -271,6 +383,7 @@ def tool_decide_new_program(
                 "tenure_years": s_rp.tenure_years,
             },
             "policy_rating_cutoffs": {"buyer": "BBB", "seller": "BB"},
+            "joint_risk_assessment": joint,
             "program_funding_ceiling_usd": PROGRAM_FUNDING_HARD_CEILING_USD,
             "indicative_program_limit_usd_before_ceiling": raw_program_limit,
             "deterministic_decision": "APPROVE" if ratings_ok else "DECLINE",
@@ -289,22 +402,21 @@ def tool_decide_new_program(
 
     # Deterministic ratings-based veto always wins.
     if not ratings_ok:
-        reason = (
-            f"Declined: buyer={b_rp.rating} (cutoff BBB), "
-            f"seller={s_rp.rating} (cutoff BB)."
-        )
+        reason = _format_rejection_reason(invoice, joint)
         if llm_rec is not None:
-            reason += f" LLM rationale: {llm_rec.rationale}"
+            reason += f"\n• Underwriter LLM memo: {llm_rec.rationale}"
         invoice.status = "REJECTED"
         invoice.decision_reason = reason
         log_event(
             db, agent="underwriter_agent", action="PROGRAM_DECLINED",
             node="underwriter_agent", severity="DECISION",
             message=reason, invoice_id=invoice.id,
-            payload={"llm_decision": llm_rec.decision if llm_rec else None,
+            payload={"joint_risk_assessment": joint,
+                     "llm_decision": llm_rec.decision if llm_rec else None,
                      "llm_rationale": llm_rec.rationale if llm_rec else None},
         )
         return {"approved": False, "reason": reason,
+                "joint_risk_assessment": joint,
                 "llm_rationale": llm_rec.rationale if llm_rec else None}
 
     # Honour the LLM's numeric recommendation if it's lower than our proposal
@@ -326,14 +438,29 @@ def tool_decide_new_program(
     db.flush()
     invoice.program_id = program.id
 
-    msg = (
-        f"Approved new program {program.id}: ${program.credit_limit_usd:,.0f} "
-        f"bilateral limit for {program.name}"
+    joint_line = (
+        f"Joint risk for {joint['product']}: buyer {joint['buyer_rating']} "
+        f"({joint['buyer_weight']*100:.0f}% weight), "
+        f"seller {joint['seller_rating']} "
+        f"({joint['seller_weight']*100:.0f}% weight) → "
+        f"combined {joint['combined_rating']}, "
+        f"blended PD {joint['blended_pd_1y']*100:.2f}%."
     )
+    msg_lines = [
+        (
+            f"Approved new program {program.id}: ${program.credit_limit_usd:,.0f} "
+            f"bilateral limit for {program.name}."
+        ),
+        f"• {joint_line}",
+    ]
     if clamped:
-        msg += f" (clamped from ${raw_program_limit:,.0f} to $100M ceiling)"
+        msg_lines.append(
+            f"• Limit clamped from ${raw_program_limit:,.0f} to the "
+            f"${PROGRAM_FUNDING_HARD_CEILING_USD:,.0f} platform ceiling."
+        )
     if llm_rec is not None:
-        msg += f" | LLM: {llm_rec.rationale}"
+        msg_lines.append(f"• Underwriter LLM memo: {llm_rec.rationale}")
+    msg = "\n".join(msg_lines)
 
     log_event(
         db, agent="underwriter_agent", action="PROGRAM_APPROVED",
@@ -344,6 +471,7 @@ def tool_decide_new_program(
             "raw_limit_usd": raw_program_limit,
             "final_limit_usd": program.credit_limit_usd,
             "clamped_to_ceiling": clamped,
+            "joint_risk_assessment": joint,
             "llm_decision": llm_rec.decision if llm_rec else None,
             "llm_rationale": llm_rec.rationale if llm_rec else None,
         },
@@ -353,6 +481,7 @@ def tool_decide_new_program(
         "program_id": program.id,
         "program_limit_usd": program.credit_limit_usd,
         "clamped_to_ceiling": clamped,
+        "joint_risk_assessment": joint,
         "llm_rationale": llm_rec.rationale if llm_rec else None,
     }
 
