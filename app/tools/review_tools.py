@@ -9,6 +9,7 @@ from .. import models
 from ..config import (
     PROGRAM_FUNDING_HARD_CEILING_USD, RATING_LADDER, llm_enabled,
 )
+from ..context import company_context, program_context
 from ..llm import (
     SYSTEM_REVIEW, ReviewRecommendation, facts_block, safe_structured_call,
 )
@@ -48,26 +49,42 @@ def tool_decide_overage(db: Session, *, invoice_id: int, overage_usd: float) -> 
         and (program.credit_limit_usd + overage_usd) > PROGRAM_FUNDING_HARD_CEILING_USD
     )
 
-    # Optional LLM recommendation — stored but never overrides the numbers.
+    # LLM review with full program + both counterparties' context.
     llm_rec: Optional[ReviewRecommendation] = None
     if llm_enabled() and program is not None:
         facts = {
-            "invoice_usd": inv.amount_usd,
-            "program_name": program.name,
-            "program_limit_usd": program.credit_limit_usd,
-            "program_utilised_usd": program.utilised_usd,
-            "overage_usd": overage_usd,
-            "program_funding_ceiling_usd": PROGRAM_FUNDING_HARD_CEILING_USD,
-            "ratings": {
-                "buyer": b_rp.rating if b_rp else None,
-                "seller": s_rp.rating if s_rp else None,
+            "invoice": {
+                "id": inv.id,
+                "amount_usd": inv.amount_usd,
+                "currency": inv.currency,
+                "product": inv.product,
+                "tenor_days": inv.tenor_days,
             },
-            "within_15pct_tolerance": within_tolerance,
-            "would_breach_ceiling_if_approved": would_breach_ceiling,
+            "program_state": program_context(db, program),
+            "buyer": company_context(db, inv.buyer),
+            "seller": company_context(db, inv.seller),
+            "overage": {
+                "overage_usd": overage_usd,
+                "overage_pct_of_program_limit": (
+                    round(100.0 * overage_usd / program.credit_limit_usd, 2)
+                    if program.credit_limit_usd else None
+                ),
+                "within_15pct_tolerance": within_tolerance,
+                "tolerance_threshold_usd": round(threshold, 2),
+            },
+            "guardrails": {
+                "would_breach_ceiling_if_approved": would_breach_ceiling,
+                "program_funding_ceiling_usd": PROGRAM_FUNDING_HARD_CEILING_USD,
+            },
         }
         llm_rec = safe_structured_call(
             SYSTEM_REVIEW,
-            f"Recommend TEMP_INCREASE or DENY.\n\n{facts_block(facts)}",
+            (
+                "Decide TEMP_INCREASE or DENY. If TEMP_INCREASE, return "
+                "`temp_increase_amount_usd` ≤ overage_usd, and never push the "
+                "program above the $100M ceiling.\n\n"
+                + facts_block(facts)
+            ),
             ReviewRecommendation,
             label="review_decide_overage",
         )
@@ -109,6 +126,75 @@ def tool_decide_overage(db: Session, *, invoice_id: int, overage_usd: float) -> 
         return {"decision": "DENIED", "reason": reason,
                 "llm_rationale": llm_rec.rationale if llm_rec else None}
 
+    # When the LLM is enabled, its decision wins (subject to guardrails):
+    #   * LLM TEMP_INCREASE  → apply the lift it recommends (clamped).
+    #   * LLM DENY           → deny, skip the rule-engine approval branch.
+    if llm_rec is not None and llm_rec.decision == "DENY" and program is not None:
+        over_pct = (overage_usd / program.credit_limit_usd * 100.0) if program.credit_limit_usd else 0.0
+        reason = "\n".join([
+            "Rejected — Review Agent (LLM) denied the temporary increase.",
+            f"• Invoice: ${inv.amount_usd:,.2f} USD.",
+            f"• Program: '{program.name}' ${program.credit_limit_usd:,.2f} "
+            f"limit (${program.utilised_usd:,.2f} used).",
+            f"• Overage: ${overage_usd:,.2f} — {over_pct:.1f}% of program limit.",
+            f"• Review LLM memo: {llm_rec.rationale}",
+        ])
+        inv.status = "REJECTED"
+        inv.decision_reason = reason
+        log_event(
+            db, agent="review_agent", action="TEMP_INCREASE_DENIED_BY_LLM",
+            node="review_agent", severity="DECISION", message=reason,
+            invoice_id=inv.id, program_id=program.id,
+            payload={
+                "sized_by": "llm_review",
+                "overage_usd": overage_usd,
+                "overage_pct_of_program_limit": over_pct,
+                "llm_rationale": llm_rec.rationale,
+            },
+        )
+        return {"decision": "DENIED", "reason": reason,
+                "sized_by": "llm_review",
+                "llm_rationale": llm_rec.rationale}
+
+    # LLM-driven temp-increase path (preferred when enabled).
+    if llm_rec is not None and llm_rec.decision == "TEMP_INCREASE" and program is not None:
+        proposed_lift = max(0.0, min(
+            float(llm_rec.temp_increase_amount_usd or overage_usd),
+            # Must at least cover this invoice's overage
+            overage_usd * 1.25,
+        ))
+        # Don't approve less than the overage actually required.
+        proposed_lift = max(proposed_lift, overage_usd)
+        # Don't breach the ceiling.
+        proposed_lift = min(
+            proposed_lift,
+            PROGRAM_FUNDING_HARD_CEILING_USD - program.credit_limit_usd,
+        )
+        if proposed_lift >= overage_usd:
+            program.credit_limit_usd = round(program.credit_limit_usd + proposed_lift, 2)
+            reason = "\n".join([
+                f"Approved temporary increase of ${proposed_lift:,.0f} (requested overage ${overage_usd:,.0f}).",
+                f"• New program limit: ${program.credit_limit_usd:,.2f}.",
+                f"• Review LLM memo: {llm_rec.rationale}",
+            ])
+            log_event(
+                db, agent="review_agent", action="TEMP_INCREASE_APPROVED",
+                node="review_agent", severity="DECISION", message=reason,
+                invoice_id=inv.id, program_id=program.id,
+                payload={
+                    "sized_by": "llm_review",
+                    "overage_usd": overage_usd,
+                    "temp_increase_usd": proposed_lift,
+                    "new_program_limit_usd": program.credit_limit_usd,
+                    "llm_rationale": llm_rec.rationale,
+                },
+            )
+            return {"decision": "TEMP_INCREASE", "reason": reason,
+                    "sized_by": "llm_review",
+                    "temp_increase_usd": proposed_lift,
+                    "llm_rationale": llm_rec.rationale}
+
+    # Rule-engine fallback (no LLM, or LLM said DENY but rules say approve).
     if ratings_ok or within_tolerance:
         reason = (
             f"Approved temporary increase of ${overage_usd:,.0f}: "
@@ -122,9 +208,11 @@ def tool_decide_overage(db: Session, *, invoice_id: int, overage_usd: float) -> 
             db, agent="review_agent", action="TEMP_INCREASE_APPROVED",
             node="review_agent", severity="DECISION", message=reason,
             invoice_id=inv.id, program_id=program.id if program else None,
-            payload={"llm_rationale": llm_rec.rationale if llm_rec else None},
+            payload={"sized_by": "rule_engine",
+                     "llm_rationale": llm_rec.rationale if llm_rec else None},
         )
         return {"decision": "TEMP_INCREASE", "reason": reason,
+                "sized_by": "rule_engine",
                 "llm_rationale": llm_rec.rationale if llm_rec else None}
 
     over_pct = (overage_usd / program.credit_limit_usd * 100.0) if program and program.credit_limit_usd else 0.0

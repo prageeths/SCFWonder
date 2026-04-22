@@ -273,10 +273,15 @@ def _generate_extra_sellers(db: Session, by_name: Dict[str, models.Company], n_t
 
 
 def _profile_all(db: Session) -> None:
-    print("[seed] Profiling companies and setting credit limits...")
+    """Seed-time profiling uses the deterministic model for speed.
+
+    The LLM-backed Rating Analyst kicks in on first live review of each
+    counterparty (e.g. when they become a party to a new invoice).
+    """
+    print("[seed] Profiling companies and setting credit limits (deterministic seed pass)...")
     companies = db.query(models.Company).all()
     for c in companies:
-        tool_build_risk_profile(db, company_id=c.id)
+        tool_build_risk_profile(db, company_id=c.id, seed_mode=True)
         tool_ensure_limits(db, company_id=c.id, product=PRODUCT_FACTORING)
         tool_ensure_limits(db, company_id=c.id, product=PRODUCT_REVERSE_FACTORING)
     db.commit()

@@ -347,11 +347,19 @@ def make_ensure_limits_node(db: Session) -> Callable[[WonderState], Dict[str, An
         invoice = db.query(models.Invoice).get(state["invoice_id"])
         tool_calls: List[Dict[str, Any]] = []
         for side, cid in (("seller", invoice.seller_id), ("buyer", invoice.buyer_id)):
-            # Ensure a risk profile exists (underwriter tool).
+            # Ensure a risk profile exists (underwriter tool). If the existing
+            # profile was produced by the deterministic seed pass AND an LLM
+            # is now configured, refresh it with the Rating Analyst so live
+            # invoices always benefit from model reasoning.
             rp_existing = db.query(models.RiskProfile).filter(
                 models.RiskProfile.company_id == cid
             ).one_or_none()
-            if rp_existing is None:
+            seed_rated = (
+                rp_existing is not None
+                and rp_existing.notes
+                and "deterministic_fallback" in rp_existing.notes
+            )
+            if rp_existing is None or (seed_rated and llm_enabled()):
                 res = tool_build_risk_profile(db, company_id=cid)
                 tool_calls.append({
                     "node": "underwriter_agent", "tool": "build_risk_profile",
